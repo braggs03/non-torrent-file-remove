@@ -10,19 +10,19 @@ use walkdir::WalkDir;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Qbittorent WebUI IP.
+    /// QBittorrent WebUI IP.
     #[arg(long)]
     ip: String,
 
-    /// Qbittorent WebUI Port.
+    /// QBittorrent WebUI Port.
     #[arg(long)]
     port: String,
 
-    /// Qbittorent WebUI Username.
+    /// QBittorrent WebUI Username.
     #[arg(long)]
     username: String,
 
-    /// Qbittorent WebUI Password.
+    /// QBittorrent WebUI Password.
     #[arg(long)]
     password: String,
 
@@ -30,8 +30,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     destructive: bool,
 
+    // Debug mode. Outputs dangling files.
     #[arg(long, short, default_value_t = false)]
-    debug: bool,
+    output: bool,
 
 }
 
@@ -64,7 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .json()
         .await
-        .and_then(|save_path: TorrentSavePath| Ok(save_path.save_path))?;
+        .and_then(|save_path: TorrentSavePath| Ok(save_path.save_path))?
+        .replace("\\", "/");
 
     let torrent_hashes: Vec<TorrentInfo> = client
         .get(format!("{}/torrents/info", api_url))
@@ -155,32 +157,32 @@ async fn remove_torrent_files_and_directories(args: &Args, all_torrent_files: Ha
         let file_type = entry.file_type();
 
         if file_type.is_file() && !all_torrent_files.contains(&file_path) {
-            if args.debug {
+            if args.output {
                 println!("Found dangling file: {}", &file_path);
             }
             if args.destructive {
                 match fs::remove_file(&file_path) {
                     Ok(_) => {},
                     Err(err) => {
-                        if args.debug {
+                        if args.output {
                             println!("Removing File Error: {}, {}", err, &file_path)
                         }
                     },
                 }
             }
-        } else if file_type.is_dir() && fs::read_dir(&file_path).unwrap().next().is_none() {
-            if args.debug {
+        } else if file_type.is_dir() && fs::read_dir(&file_path).unwrap().next().is_none() && !save_path.eq(&file_path) {
+            if args.output {
                 println!("Found dangling folder: {}", &file_path);
             }
             if args.destructive {
                 match fs::remove_dir(&file_path) {
                     Err(err) => {
-                        if args.debug {
+                        if args.output {
                             println!("Removing Empty Directory Error: {}, {}", err, &file_path)
                         }
                     },
                     _ => {},
-                };
+                }
             }
         }
     }  
