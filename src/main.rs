@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
+use std::net::TcpStream;
+use std::process::Output;
 use std::{collections::HashMap, sync::Arc};
 
 use clap::Parser;
@@ -7,33 +9,73 @@ use reqwest::Client;
 use reqwest::cookie::Jar;
 use walkdir::WalkDir;
 
-#[derive(Parser, Debug)]
+const DEFAULT_HOST: &str = "localhost";
+const DEFAULT_SSH_PORT: &str = "22";
+const DEFAULT_SSH_SAVE_PATH: &str = "EMPTY";
+
+const SSH: &str = "ssh";
+const TRUE: &str = "true";
+
+#[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// QBittorrent WebUI IP.
-    #[arg(long)]
-    ip: String,
 
-    /// QBittorrent WebUI Port.
+    /// QBittorrent WebUI Port
     #[arg(long)]
     port: String,
 
-    /// QBittorrent WebUI Username.
+    /// QBittorrent WebUI Username
     #[arg(long)]
     username: String,
 
-    /// QBittorrent WebUI Password.
+    /// QBittorrent WebUI Password
     #[arg(long)]
     password: String,
 
-    /// Whether files should be deleted.
+    // Output Mode - Outputs Dangling Files
+    #[clap(long, default_value_t = OutputLevel::None, value_enum)]
+    output: OutputLevel,
+
+    /// Delete File Mode
     #[arg(long, default_value_t = false)]
     destructive: bool,
 
-    // Debug mode. Outputs dangling files.
-    #[arg(long, short, default_value_t = false)]
-    output: bool,
+    /// Enable SSH mode
+    #[arg(long)]
+    ssh: bool,
 
+    /// SSH username
+    #[arg(long, required_if_eq(SSH, TRUE))]
+    ssh_username: Option<String>,
+
+    /// SSH password
+    #[arg(long, required_if_eq(SSH, TRUE))]
+    ssh_password: Option<String>,
+
+    /// SSH IP address
+    #[arg(long, required_if_eq(SSH, TRUE))]
+    ip: Option<String>,
+
+    /// SSH port
+    #[arg(long, default_value_t = String::from(DEFAULT_SSH_PORT))]
+    ssh_port: String,
+
+    /// Host machine save path for QBittorrent client
+    #[arg(long, default_value_t = String::from(DEFAULT_SSH_SAVE_PATH))]
+    host_container_save_path: String,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum, PartialEq, PartialOrd)]
+enum OutputLevel {
+    None = 0,
+    Info = 1,
+    Debug = 2,
+}
+
+impl OutputLevel {
+    fn within(&self, required: OutputLevel) -> bool {
+        *self >= required
+    }
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -55,7 +97,17 @@ struct TorrentFile {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let api_url = format!("http://{}:{}/api/v2", args.ip, args.port);
+    let api_url = if args.ssh {
+        let ip = args.ip.clone().expect("UNREACHABLE: CLAP ensures arguments are set.");
+        format!("http://{}:{}/api/v2", ip, args.port)
+    } else {
+        if args.ip.clone().is_some() && !DEFAULT_HOST.eq(&args.ip.clone().unwrap()) {
+            panic!("Error: IP is set, but SSH is not set.");
+        }
+        format!("http://{}:{}/api/v2", DEFAULT_HOST, args.port)
+    };
+
+
 
     let client = get_login_client(&args, &api_url).await?;
 
@@ -75,10 +127,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .await?;
 
+    let all_torrent_files = get_torrent_files(&args, &client, &api_url, &save_path, torrent_hashes).await?;
 
-    let all_torrent_files = get_torrent_files(&client, &api_url, &save_path, torrent_hashes).await?;
-
-    let _ = remove_torrent_files_and_directories(&args, all_torrent_files, &save_path).await?;
+    let _ = if args.ssh {
+        ssh_remove_torrent_files_and_directories(&args, all_torrent_files, &save_path).await?
+    } else {
+        remove_torrent_files_and_directories(&args, all_torrent_files, &save_path).await?;
+    };
 
     Ok(())
 }
@@ -102,6 +157,7 @@ async fn get_login_client(args: &Args, api_url: &str) -> Result<Client, Box<dyn 
 }
 
 async fn get_torrent_files(
+    args: &Args,
     client: &Client, 
     api_url: &str, 
     save_path: &str, 
@@ -120,6 +176,9 @@ async fn get_torrent_files(
             .await?;
             
         files.iter().for_each(|file| {
+            if args.output.within(OutputLevel::Debug) {
+                println!("{}", format!("{}/{}", save_path, file.name).replace("\\", "/"));
+            }
             all_torrent_files.insert(format!("{}/{}", save_path, file.name).replace("\\", "/"));
         });
     }
@@ -157,27 +216,27 @@ async fn remove_torrent_files_and_directories(args: &Args, all_torrent_files: Ha
         let file_type = entry.file_type();
 
         if file_type.is_file() && !all_torrent_files.contains(&file_path) {
-            if args.output {
+            if args.output.within(OutputLevel::Info) {
                 println!("Found dangling file: {}", &file_path);
             }
             if args.destructive {
                 match fs::remove_file(&file_path) {
                     Ok(_) => {},
                     Err(err) => {
-                        if args.output {
+                        if args.output.within(OutputLevel::Info) {
                             println!("Removing File Error: {}, {}", err, &file_path)
                         }
                     },
                 }
             }
         } else if file_type.is_dir() && fs::read_dir(&file_path).unwrap().next().is_none() && !save_path.eq(&file_path) {
-            if args.output {
+            if args.output.within(OutputLevel::Info) {
                 println!("Found dangling folder: {}", &file_path);
             }
             if args.destructive {
                 match fs::remove_dir(&file_path) {
                     Err(err) => {
-                        if args.output {
+                        if args.output.within(OutputLevel::Info) {
                             println!("Removing Empty Directory Error: {}, {}", err, &file_path)
                         }
                     },
@@ -190,4 +249,14 @@ async fn remove_torrent_files_and_directories(args: &Args, all_torrent_files: Ha
 
 
     Ok(())
+}
+
+async fn ssh_remove_torrent_files_and_directories(args: &Args, _all_torrent_files: HashSet<String>, _save_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+
+
+    let ip = args.ip.clone().expect("UNREACHABLE: CLAP ensures arguments are set.");
+    println!("{}", format!("{}:{}", ip, args.ssh_port));
+    let _tcp = TcpStream::connect(format!("{}:{}", ip, args.ssh_port)).unwrap();
+
+    todo!()
 }
